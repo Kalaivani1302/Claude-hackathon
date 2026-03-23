@@ -2,6 +2,10 @@
 
 ## Participants
 - Kalaivani Karuppanan (Architect · Developer · PM · Tester)
+- Roopali (Developer)
+- Rajesh (Project Manager)
+- Nalini (Tester)
+- Nitin ( Developer)
 
 ## Scenario
 **Scenario 5: Agentic Solution (Claude Agent SDK)** — IT Helpdesk Domain
