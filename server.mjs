@@ -304,7 +304,13 @@ app.post("/api/approve", (req, res) => {
 // GET /api/audit
 app.get("/api/audit", (_req, res) => res.json(AUDIT_LOG));
 
-const PORT = 3000;
+// Serve presentation deck
+app.get("/presentation", (_req, res) => {
+  res.sendFile(path.join(__dirname, "presentation.html"));
+});
+
+const PORT = process.env.PORT || 3002;
 app.listen(PORT, () => {
-  console.log(`\n  ✓ IT Helpdesk Agent running at http://localhost:${PORT}\n`);
+  console.log(`\n  ✓ IT Helpdesk Agent  →  http://localhost:${PORT}`);
+  console.log(`  ✓ Presentation deck  →  http://localhost:${PORT}/presentation\n`);
 });
