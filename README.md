@@ -1,4 +1,4 @@
-# Team Kalaivani — IT Helpdesk Triage Agent
+# Team Agentzero — IT Helpdesk Triage Agent
 
 ## Participants
 - Kalaivani Karuppanan (Architect · Developer · PM · Tester)
