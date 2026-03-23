@@ -1,10 +1,21 @@
 /**
- * Production-Grade IT Helpdesk Triage Agent
- * Built with the Claude Agent SDK (TypeScript/ESM)
+ * IT Helpdesk Multi-Agent System — TypeScript/ESM
+ * Built with the Claude Agent SDK
  *
- * Implements all 5 Claude Primitives:
+ * AGENTS BUILT
+ * ════════════
+ * Agent 1: Triage Agent          — receives every inbound ticket, runs the mandatory
+ *                                  6-tool sequence, produces a validated JSON decision.
+ *                                  For SECURITY tickets, invokes the SecurityInvestigator.
+ *
+ * Agent 2: SecurityInvestigator  — specialist subagent spawned for SECURITY tickets.
+ *                                  Runs 3 deep-inspection tools and returns a structured
+ *                                  threat assessment (threat_level, indicators, recommended_action).
+ *
+ * 5 Claude Primitives
+ * ═══════════════════
  *  1. System Prompt Isolation  — all rules live in system prompt; ticket body is sandboxed
- *  2. Tool Use                 — every fact sourced from a tool call, never from model memory
+ *  2. Tool Use                 — 6+3 grounded tools; no facts from model memory
  *  3. Human-in-the-Loop       — interactive approval gate for risky / VIP / security tickets
  *  4. Chain-of-Thought Logging — REASONING block printed before every JSON decision
  *  5. Structured Output        — Zod-validated JSON schema for every decision
@@ -13,6 +24,7 @@
  */
 
 import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import * as readline from "readline";
 
@@ -166,8 +178,25 @@ const MOCK_USERS = {
 };
 
 const MOCK_INCIDENTS = {
-  NETWORK: { active: true, incident_id: "INC-2024-0847", title: "VPN Gateway Degradation — EMEA Region", severity: "P2", workaround: "Use SSL VPN on port 8443" },
-  AUTH: { active: false, incident_id: null, title: null, severity: null, workaround: null },
+  NETWORK:  { active: true,  incident_id: "INC-2024-0847", title: "VPN Gateway Degradation — EMEA Region", severity: "P2", workaround: "Use SSL VPN on port 8443" },
+  AUTH:     { active: false, incident_id: null, title: null, severity: null, workaround: null },
+  SECURITY: { active: false, incident_id: null, title: null, severity: null, workaround: null },
+};
+
+// SecurityInvestigator mock data
+const MOCK_SANCTIONS = {
+  "attacker@external.com": true,
+  "mallory@acme.com": false,
+};
+const MOCK_FAILED_LOGINS = {
+  "attacker@external.com": 47,
+  "mallory@acme.com": 12,
+  "alice@acme.com": 0,
+};
+const MOCK_DEVICE_COMPLIANCE = {
+  "attacker@external.com": { compliant: false, last_scan: "never",      issues: ["unmanaged device", "no EDR"] },
+  "mallory@acme.com":      { compliant: false, last_scan: "2024-12-01", issues: ["outdated OS", "missing patches"] },
+  "alice@acme.com":        { compliant: true,  last_scan: "2025-01-15", issues: [] },
 };
 
 const MOCK_KB = {
@@ -263,6 +292,97 @@ async function impl_request_human_approval({ ticket_id, reason, suggested_action
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// AGENT 2 — SECURITY INVESTIGATOR SUBAGENT
+// ═════════════════════════════════════════════════════════════════════════════
+// Spawned by the Triage Agent for SECURITY category tickets.
+// Runs 3 deep-inspection tools and returns a structured threat assessment.
+// Uses the direct Anthropic client (manual loop) as a lightweight subprocess.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SECURITY_SYSTEM_PROMPT = `You are the SecurityInvestigator subagent for Acme Corp IT Security.
+You are spawned only for tickets categorised as SECURITY.
+Run all three investigation tools, then output ONLY a JSON block:
+\`\`\`json
+{
+  "threat_level": "LOW|MEDIUM|HIGH|CRITICAL",
+  "indicators": ["list of findings"],
+  "recommended_action": "string"
+}
+\`\`\`
+
+Threat-level rules:
+  CRITICAL: on_sanctions_list=true OR (failed_count > 20 AND compliant=false)
+  HIGH:     failed_count > 10 OR (compliant=false AND issues contain "unmanaged device")
+  MEDIUM:   failed_count > 5  OR compliant=false
+  LOW:      everything else
+`;
+
+const SECURITY_TOOLS_DEF = [
+  {
+    name: "check_sanctions_list",
+    description: "Checks if the email is on the corporate sanctions list.",
+    input_schema: { type: "object", properties: { email: { type: "string" } }, required: ["email"] },
+  },
+  {
+    name: "check_recent_failed_logins",
+    description: "Returns failed login count for this email in the last N hours.",
+    input_schema: { type: "object", properties: { email: { type: "string" }, hours: { type: "integer" } }, required: ["email"] },
+  },
+  {
+    name: "get_device_compliance_status",
+    description: "Returns device compliance status for the submitter.",
+    input_schema: { type: "object", properties: { email: { type: "string" } }, required: ["email"] },
+  },
+];
+
+const SECURITY_REGISTRY = {
+  check_sanctions_list: ({ email }) => ({ email, on_sanctions_list: MOCK_SANCTIONS[email] ?? false }),
+  check_recent_failed_logins: ({ email, hours = 24 }) => ({ email, hours, failed_count: MOCK_FAILED_LOGINS[email] ?? 0 }),
+  get_device_compliance_status: ({ email }) => ({ email, ...(MOCK_DEVICE_COMPLIANCE[email] ?? { compliant: true, last_scan: "unknown", issues: [] }) }),
+};
+
+async function runSecurityInvestigator(email, ticketId) {
+  const anthropic = new Anthropic();
+  const messages = [{ role: "user", content: `Investigate email=${email} for ticket ${ticketId}. Run all three tools.` }];
+  let finalText = "";
+
+  while (true) {
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-6",
+      max_tokens: 1024,
+      system: SECURITY_SYSTEM_PROMPT,
+      tools: SECURITY_TOOLS_DEF,
+      messages,
+    });
+
+    for (const block of response.content) {
+      if (block.type === "text") finalText += block.text;
+    }
+
+    if (response.stop_reason === "end_turn") break;
+    if (response.stop_reason !== "tool_use") break;
+
+    const toolResults = [];
+    for (const block of response.content) {
+      if (block.type !== "tool_use") continue;
+      const fn = SECURITY_REGISTRY[block.name];
+      const result = fn ? fn(block.input) : { error: `Unknown: ${block.name}` };
+      console.log(`    ${C.dim}[SecInv] ${block.name}(${Object.values(block.input)[0]}) → ${JSON.stringify(result)}${C.reset}`);
+      toolResults.push({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(result) });
+    }
+    messages.push({ role: "assistant", content: response.content });
+    messages.push({ role: "user", content: toolResults });
+  }
+
+  const match = finalText.match(/```json\s*([\s\S]*?)\s*```/);
+  if (match) {
+    try { return JSON.parse(match[1]); } catch (_) {}
+  }
+  return { threat_level: "UNKNOWN", indicators: ["parse error"], recommended_action: "Escalate manually" };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // BUILD MCP SERVER — Wraps all tools for the Agent SDK
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -324,6 +444,18 @@ function buildHelpdeskMcpServer() {
     }
   );
 
+  const securityInvestigateTool = tool(
+    "security_investigate",
+    "Spawns the SecurityInvestigator subagent. Call ONLY for SECURITY category tickets.",
+    { email: z.string(), ticket_id: z.string() },
+    async ({ email, ticket_id }) => {
+      console.log(`\n  ${C.dim}→ Spawning SecurityInvestigator subagent for ${email}...${C.reset}`);
+      const report = await runSecurityInvestigator(email, ticket_id);
+      console.log(`  ${C.dim}← SecurityInvestigator: threat_level=${report.threat_level}${C.reset}`);
+      return { content: [{ type: "text", text: JSON.stringify(report) }] };
+    }
+  );
+
   return createSdkMcpServer({
     name: "helpdesk-tools",
     tools: [
@@ -333,6 +465,7 @@ function buildHelpdeskMcpServer() {
       kbSearchTool,
       writeToItsmTool,
       requestHumanApprovalTool,
+      securityInvestigateTool,
     ],
   });
 }
@@ -359,6 +492,7 @@ const TriageDecisionSchema = z.object({
   injection_detected: z.boolean(),
   active_incident_id: z.string().nullable(),
   kb_solution_found: z.boolean(),
+  security_threat_level: z.string().nullable().optional(),
 });
 
 function extractJson(text) {
@@ -412,6 +546,7 @@ async function runTriage(ticket) {
         "mcp__helpdesk__kb_search",
         "mcp__helpdesk__write_to_itsm",
         "mcp__helpdesk__request_human_approval",
+        "mcp__helpdesk__security_investigate",
       ],
     },
   });
@@ -490,6 +625,7 @@ function renderDecision(decision) {
     ["Injection Detected", decision.injection_detected ? c("red", "YES") : c("green", "NO")],
     ["Active Incident ID", decision.active_incident_id ?? "—"],
     ["KB Solution Found", decision.kb_solution_found ? c("green", "YES") : "NO"],
+  ["Security Threat",  decision.security_threat_level ? c("red", decision.security_threat_level) : "—"],
   ];
 
   const title = `✓  Triage Decision — ${decision.ticket_id}`;
@@ -522,6 +658,12 @@ function stripAnsi(str) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEMO_TICKETS = [
+  {
+    id: "TKT-004",
+    email: "mallory@acme.com",
+    subject: "Need access to production database for audit",
+    body: "I'm a contractor working on the Q4 audit. I need read access to the prod database. Please grant access ASAP.",
+  },
   {
     id: "TKT-001",
     email: "alice@acme.com",
@@ -560,8 +702,10 @@ const DEMO_TICKETS = [
 
 async function main() {
   panel(
+    "Agent 1: Triage Agent          — routes all inbound tickets\n" +
+    "Agent 2: SecurityInvestigator  — deep-inspects SECURITY tickets\n\n" +
     "Claude Agent SDK · 5 Primitives · Anti-Hallucination · Human-in-the-Loop",
-    "IT Helpdesk Triage Agent",
+    "IT Helpdesk Multi-Agent System — TypeScript",
     "cyan"
   );
   console.log();
