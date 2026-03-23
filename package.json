@@ -1,0 +1,13 @@
+{
+  "name": "it-helpdesk-triage-agent",
+  "version": "1.0.0",
+  "description": "Production-grade IT Helpdesk Triage Agent — Claude Agent SDK · 5 Primitives",
+  "type": "module",
+  "scripts": {
+    "start": "node helpdesk_agent.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.81",
+    "zod": "^4.3.6"
+  }
+}
